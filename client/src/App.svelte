@@ -30,6 +30,9 @@
   $: ebookResult = $ebookStore.result;
   $: ebookLoading = $ebookStore.loading;
   $: ebookError = $ebookStore.error;
+  $: ebookProgress = $ebookStore.progress;
+  $: ebookProgressMessage = $ebookStore.progressMessage;
+  $: ebookStatus = $ebookStore.status;
 
   async function checkHealth() {
     appState.update(state => ({ ...state, loading: true, error: null }));
@@ -141,6 +144,9 @@
         
         {#if ebookLoading}
           <p class="loading-message">Generating e-book...</p>
+          {#if ebookProgressMessage}
+            <p class="progress-message">{ebookProgressMessage}</p>
+          {/if}
         {/if}
         
         {#if ebookError}
@@ -329,6 +335,17 @@
     color: #4f46e5;
     font-weight: 500;
     margin: 1rem 0;
+  }
+  
+  .progress-message {
+    color: #9333ea;
+    font-size: 0.95rem;
+    margin: 0.5rem 0 1rem 0;
+    padding: 0.5rem 1rem;
+    background: #fdf4ff;
+    border-left: 3px solid #9333ea;
+    border-radius: 4px;
+    font-weight: 500;
   }
   
   .error-message {

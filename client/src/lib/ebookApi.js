@@ -123,28 +123,41 @@ export async function initiateEbookGeneration(payload) {
 }
 
 /**
- * Check the status of an ebook generation job
+ * Check the status of an ebook generation job (single check, no retry)
  * @param {string} jobId - Job ID from initiateEbookGeneration
  * @returns {Promise<Object>} { jobId, status, progress, message, estimatedTimeRemainingSeconds }
  */
 export async function checkEbookStatus(jobId) {
-  const status = await fetchWithTimeout(
-    `${CONFIG.API_BASE_URL}/ebook/generate/${jobId}/status`,
-    { method: "GET" },
-    10000 // Quick timeout for status checks
-  );
-
-  // Also fetch and log quota status for monitoring
-  const quotaStatus = await getQuotaStatus();
-  if (quotaStatus?.quota) {
-    console.log(
-      `[API] Quota: ${quotaStatus.quota.percentUsed}% used (${quotaStatus.quota.callCount}/${quotaStatus.quota.limit})`
+  try {
+    const status = await fetchWithTimeout(
+      `${CONFIG.API_BASE_URL}/ebook/generate/${jobId}/status`,
+      { method: "GET" },
+      10000 // Quick timeout for status checks
     );
-    // Add quota info to status for frontend display
-    status.quotaInfo = quotaStatus.quota;
-  }
 
-  return status;
+    // Also fetch and log quota status for monitoring
+    try {
+      const quotaStatus = await getQuotaStatus();
+      if (quotaStatus?.quota) {
+        console.log(
+          `[API] Quota: ${quotaStatus.quota.percentUsed}% used (${quotaStatus.quota.callCount}/${quotaStatus.quota.limit})`
+        );
+        // Add quota info to status for frontend display
+        status.quotaInfo = quotaStatus.quota;
+      }
+    } catch (quotaErr) {
+      console.warn("[API] Failed to fetch quota status:", quotaErr.message);
+      // Continue without quota info
+    }
+
+    return status;
+  } catch (error) {
+    // Preserve 429 errors for handling by rate-limit poller
+    if (error.message && error.message.includes("429")) {
+      throw error;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -161,22 +174,25 @@ export async function fetchEbookResult(jobId) {
 }
 
 /**
- * Poll for ebook generation completion
- * Repeatedly checks status until complete or error
+ * Poll for ebook generation completion with rate-limit awareness
+ * Repeatedly checks status until complete or error, gracefully handling 429 rate limits
  * @param {string} jobId - Job ID from initiateEbookGeneration
- * @param {Function} onProgress - Callback for progress updates: (progress, message) => {}
- * @param {number} maxWaitTime - Maximum wait time in milliseconds (default 300000)
+ * @param {Function} onProgress - Callback for progress updates: (progress, message, data) => {}
+ * @param {number} maxWaitTime - Maximum wait time in milliseconds (default 3600000 = 1 hour)
  * @returns {Promise<Object>} Complete ebook result when ready
  */
 export async function pollEbookCompletion(
   jobId,
   onProgress,
-  maxWaitTime = 300000
+  maxWaitTime = 3600000 // 1 hour
 ) {
-  const pollInterval = 2000; // 2 seconds
+  const { RateLimitAwarePoller } = await import("./rateLimitPoller.js");
+  const { JobStorage } = await import("./jobStorage.js");
+
+  const poller = new RateLimitAwarePoller(jobId);
   const startTime = Date.now();
 
-  console.log(`[API] Starting poll for job ${jobId}`);
+  console.log(`[API] Starting poll for job ${jobId} with rate-limit awareness`);
 
   while (true) {
     // Check timeout
@@ -187,45 +203,80 @@ export async function pollEbookCompletion(
     }
 
     try {
-      // Poll status
-      const status = await checkEbookStatus(jobId);
+      // Attempt status check with rate-limit awareness
+      const result = await poller.checkStatus();
 
-      console.log(
-        `[API] Job ${jobId} status: ${status.status}, progress: ${status.progress}%`
-      );
+      if (result.ok) {
+        const status = result.data;
 
-      // Notify caller of progress (including quota info if available)
-      if (onProgress) {
-        const quotaInfo = status.quotaInfo || null;
-        onProgress(status.progress, status.message, quotaInfo);
+        console.log(
+          `[API] Job ${jobId} status: ${status.status}, progress: ${status.progress}%`
+        );
+
+        // Notify caller of progress
+        if (onProgress) {
+          onProgress(status.progress, status.status, status);
+        }
+
+        if (status.status === "completed") {
+          console.log(`[API] Job ${jobId} complete, fetching result...`);
+          // Fetch final result
+          const finalResult = await fetchEbookResult(jobId);
+          console.log(`[API] Job ${jobId} result fetched successfully`);
+          JobStorage.update({ status: "completed" });
+          return finalResult;
+        } else if (status.status === "failed") {
+          throw new Error(`Ebook generation failed: ${status.error}`);
+        }
+
+        // Wait before next poll
+        const pollInterval = 2000; // 2 seconds baseline
+        await new Promise((resolve) => setTimeout(resolve, pollInterval));
+      }
+    } catch (error) {
+      // Handle rate limit errors with backoff
+      const { RateLimitError } = await import("./rateLimitPoller.js");
+
+      if (error instanceof RateLimitError) {
+        // Log rate limit but continue polling
+        console.warn(`[API] Rate limited:`, error.message);
+
+        if (onProgress) {
+          onProgress(undefined, "rate_limited", {
+            message: error.message,
+            backoffMs: error.backoffMs,
+          });
+        }
+
+        // Wait with backoff before retrying
+        await new Promise((resolve) => setTimeout(resolve, error.backoffMs));
+        continue; // Don't increment attempt counter
       }
 
-      if (status.status === "complete") {
-        console.log(`[API] Job ${jobId} complete, fetching result...`);
-        // Fetch final result
-        const result = await fetchEbookResult(jobId);
-        console.log(`[API] Job ${jobId} result fetched successfully`);
-        return result;
-      } else if (status.status === "error") {
-        throw new Error(`Ebook generation failed: ${status.error}`);
+      // Check for circuit breaker
+      if (poller.isCircuitBreakerOpen()) {
+        console.error(`[API] Circuit breaker opened:`, error.message);
+        throw new Error(
+          "Polling circuit breaker opened. Job may have completed. " +
+            `Check status manually at /api/ebook/generate/${jobId}/status`
+        );
       }
 
-      // Wait before next poll
-      await new Promise((resolve) => setTimeout(resolve, pollInterval));
-    } catch (err) {
-      // If it's a timeout or network error, retry; otherwise throw
+      // Handle transient errors (network, timeout)
       if (
-        err.message.includes("timeout") ||
-        err.message.includes("Network error")
+        error.message.includes("timeout") ||
+        error.message.includes("Network error")
       ) {
         console.warn(
-          `[API] Transient error during polling, will retry: ${err.message}`
+          `[API] Transient error during polling, will retry: ${error.message}`
         );
         // Wait a bit longer before retrying after transient error
         await new Promise((resolve) => setTimeout(resolve, 5000));
         continue;
       }
-      throw err;
+
+      // Other errors are fatal
+      throw error;
     }
   }
 }

@@ -411,6 +411,57 @@ app.use((req, res, next) => {
   next();
 });
 
+// Middleware to attach rate-limit headers to responses
+// Allows frontend clients to understand quota status and implement smart retry logic
+app.use((req, res, next) => {
+  // Capture the original send function
+  const originalSend = res.send;
+
+  // Override send to attach rate-limit headers before sending response
+  res.send = function (data) {
+    try {
+      const { quotaTracker } = require("./geminiClient");
+
+      if (quotaTracker) {
+        const remaining = quotaTracker.getStatus().remaining || 0;
+        const limit = quotaTracker.getStatus().limit || 20;
+        const status = quotaTracker.getStatus();
+
+        res.set({
+          "X-RateLimit-Limit": limit.toString(),
+          "X-RateLimit-Remaining": Math.max(0, remaining).toString(),
+          "X-RateLimit-Reset": Math.ceil(
+            status.pauseUntil
+              ? status.pauseUntil / 1000
+              : (Date.now() + 60000) / 1000
+          ).toString(),
+        });
+
+        // Add Retry-After if approaching limit
+        if (remaining <= 2) {
+          const resetTime = status.pauseUntil || Date.now() + 60000;
+          const retryAfter = Math.max(
+            1,
+            Math.ceil((resetTime - Date.now()) / 1000)
+          );
+          res.set("Retry-After", retryAfter.toString());
+        }
+      }
+    } catch (err) {
+      console.warn(
+        "[RATE-LIMIT-HEADERS] Error attaching headers:",
+        err.message
+      );
+      // Continue without headers if quota tracker fails
+    }
+
+    // Call the original send with context
+    return originalSend.call(this, data);
+  };
+
+  next();
+});
+
 // Dev-only token auth middleware. Enable by setting DEV_AUTH_TOKEN in the
 // environment. This protects the dev server if you need to make forwarded
 // ports public during testing. It intentionally allows the root and health
@@ -3221,6 +3272,40 @@ app.get("/api/ebook/generate/:jobId/status", (req, res) => {
   }
 
   res.json(status);
+});
+
+/**
+ * GET /api/ebook/generate/:jobId/summary
+ * Lightweight summary endpoint for job status
+ * Returns minimal job state without full response data
+ * Used by frontend polling to check progress with rate-limit awareness
+ */
+app.get("/api/ebook/generate/:jobId/summary", (req, res) => {
+  const { jobId } = req.params;
+
+  try {
+    const status = jobQueueManager.getStatus(jobId);
+
+    if (status.error) {
+      return res.status(404).json({
+        error: "Job not found",
+        jobId,
+      });
+    }
+
+    // Return minimal state (no full response data)
+    res.json({
+      jobId: jobId,
+      status: status.status, // 'processing', 'completed', 'failed'
+      progress: status.progress || 0,
+      completedAt: status.completedAt || null,
+      error: status.error || null,
+      message: status.message || null,
+    });
+  } catch (err) {
+    console.error("[SUMMARY-ENDPOINT] Error:", err);
+    res.status(500).json({ error: "Failed to fetch job summary" });
+  }
 });
 
 /**

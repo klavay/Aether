@@ -128,6 +128,7 @@ function createEbookStore() {
 
       try {
         const currentStore = get({ subscribe });
+        const { JobStorage } = await import("../lib/jobStorage.js");
 
         // Step 1: Initiate generation (returns immediately with jobId)
         console.log("[EBOOK] Initiating generation request...");
@@ -142,19 +143,38 @@ function createEbookStore() {
         const { jobId } = initResponse;
         console.log(`[EBOOK] Generation initiated with jobId: ${jobId}`);
 
+        // Save job state for recovery
+        JobStorage.save(jobId, {
+          prompt,
+          config: currentStore.config,
+          requestedAt: new Date().toISOString(),
+        });
+
         // Step 2: Poll for completion with progress updates
         const response = await ebookApi.pollEbookCompletion(
           jobId,
-          (progress, message, quotaInfo) => {
-            let fullMessage = message;
-            if (quotaInfo) {
-              fullMessage += ` (Quota: ${quotaInfo.percentUsed}%)`;
+          (progress, status, data) => {
+            let fullMessage = "";
+
+            // Handle different status types
+            if (status === "rate_limited") {
+              fullMessage = `⏳ Rate-limited. Waiting to resume... (${Math.round(
+                data.backoffMs / 1000
+              )}s)`;
+              console.warn(`[EBOOK] Rate limited, backing off...`);
+            } else if (status === "processing") {
+              fullMessage =
+                data?.message || `Processing... ${Math.round(progress || 0)}%`;
+            } else {
+              fullMessage = status || "Processing...";
             }
+
             console.log(`[EBOOK] Progress: ${progress}% - ${fullMessage}`);
             update((store) => ({
               ...store,
-              progress,
+              progress: progress || store.progress,
               progressMessage: fullMessage,
+              status: status === "rate_limited" ? "rate_limited" : "generating",
             }));
           }
         );
@@ -169,6 +189,9 @@ function createEbookStore() {
         console.log("[FRONTEND] - title:", response.title);
         console.log("[FRONTEND] - pages:", response.pages?.length || 0);
 
+        // Clear job state on success
+        JobStorage.clear();
+
         update((store) => ({
           ...store,
           result: response,
@@ -181,9 +204,17 @@ function createEbookStore() {
         }));
       } catch (err) {
         console.error("[EBOOK] Generation error:", err);
+
+        // Handle circuit breaker and other errors gracefully
+        let errorMessage = err.message;
+        if (err.message && err.message.includes("Circuit breaker")) {
+          errorMessage =
+            "Job generation timeout. Your ebook may have completed - please check manually or try again.";
+        }
+
         update((store) => ({
           ...store,
-          error: err.message,
+          error: errorMessage,
           loading: false,
           status: "error",
           progress: 0,
